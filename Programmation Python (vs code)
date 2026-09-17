@@ -1,0 +1,374 @@
+import speech_recognition as sr
+import sounddevice as sd
+import numpy as np
+import wave
+import tempfile
+import os
+import random
+import time
+import pythoncom
+import win32com.client
+import serial
+
+# ==================================================
+# CONFIGURATION DE LA LIAISON AVEC L'ARDUINO UNO
+# ==================================================
+# Port série sur lequel l'Arduino Uno est branché (câble USB).
+# Sous Windows : "COM3", "COM4", etc. (regarde dans le
+# Gestionnaire de périphériques). Sous Linux/Mac : quelque
+# chose comme "/dev/ttyUSB0" ou "/dev/cu.usbserial-XXXX".
+PORT_ARDUINO = "COM5"  # à vérifier dans le Gestionnaire de périphériques une fois l'Uno branché
+BAUDRATE_ARDUINO = 115200
+
+liaison_arduino = None
+
+
+def connecter_arduino():
+    """Ouvre la connexion série avec l'Arduino Uno. À appeler une
+    seule fois au démarrage du programme."""
+    global liaison_arduino
+
+    try:
+        # MODIF : par défaut, l'ouverture du port série active le signal
+        # DTR, ce qui REDÉMARRE l'Uno et remet donc le compteur de
+        # sucettes à 0. On désactive DTR (et RTS) AVANT d'ouvrir le
+        # port : la carte garde son état, donc le servo reste bloqué
+        # même si on relance le script Python.
+        liaison_arduino = serial.Serial()
+        liaison_arduino.port = PORT_ARDUINO
+        liaison_arduino.baudrate = BAUDRATE_ARDUINO
+        liaison_arduino.timeout = 1
+        liaison_arduino.dtr = False
+        liaison_arduino.rts = False
+        liaison_arduino.open()
+
+        # Plus besoin d'attendre 2 secondes de reboot : une courte
+        # pause suffit à stabiliser la liaison.
+        time.sleep(0.3)
+        print(f"Arduino Uno connecté sur {PORT_ARDUINO} (sans reset).")
+
+    except Exception as erreur:
+        print("Impossible de se connecter à l'Arduino Uno :", erreur)
+        liaison_arduino = None
+
+
+def envoyer_commande(commande):
+    """Envoie une commande texte à l'Arduino (DISPENSE, ERREUR, PARLE_DEBUT, PARLE_FIN...)."""
+    global liaison_arduino
+
+    if liaison_arduino is None or not liaison_arduino.is_open:
+        return
+
+    try:
+        liaison_arduino.write((commande + "\n").encode())
+
+    except Exception as erreur:
+        print("Erreur lors de l'envoi de la commande :", erreur)
+
+
+def envoyer_commande_dispense():
+    """Demande à l'Arduino d'ouvrir la trappe et de distribuer une sucette.
+    L'Arduino refuse lui-même si le servo est verrouillé (3 sucettes déjà
+    distribuées), ou si moins de 5 secondes se sont écoulées depuis la
+    dernière distribution."""
+    print("Commande DISPENSE envoyée à l'Arduino.")
+    envoyer_commande("DISPENSE")
+
+
+def envoyer_commande_erreur():
+    """Signale à l'Arduino que la réponse était fausse
+    (visage triste + LED rouge qui clignote)."""
+    print("Commande ERREUR envoyée à l'Arduino.")
+    envoyer_commande("ERREUR")
+
+
+# ==================================================
+# CONFIGURATION DE LA VOIX DE RICK-E
+# ==================================================
+
+def parler(texte):
+    print("RICK-E :", texte)
+
+    # Prévient l'Arduino pour qu'il anime la bouche pendant la phrase
+    envoyer_commande("PARLE_DEBUT")
+
+    try:
+        pythoncom.CoInitialize()
+
+        speaker = win32com.client.Dispatch("SAPI.SpVoice")
+        speaker.Rate = 1        # vitesse : -10 (lent) à 10 (rapide)
+        speaker.Volume = 100    # volume : 0 à 100
+
+        speaker.Speak(str(texte))
+
+    except Exception as erreur:
+        print("Erreur de voix :", erreur)
+
+    finally:
+        pythoncom.CoUninitialize()
+        # La bouche s'arrête pile quand la phrase est terminée,
+        # puisque speaker.Speak() est bloquant.
+        envoyer_commande("PARLE_FIN")
+
+
+# ==================================================
+# ENREGISTREMENT AUDIO AVEC DÉTECTION DE SILENCE
+# ==================================================
+# Au lieu d'enregistrer pendant une durée fixe (ce qui coupe
+# les phrases longues ou ajoute du silence inutile pour les
+# phrases courtes), on enregistre tant que la personne parle
+# et on s'arrête automatiquement après un court silence.
+
+def enregistrer_audio(duree_max=8, frequence=44100, seuil_silence=500, silence_max=1.2):
+    print("🎤 Parle maintenant...")
+
+    # Petite marge avant de commencer à écouter, pour laisser
+    # le temps à la personne de réagir après le signal.
+    time.sleep(0.4)
+
+    taille_bloc = int(frequence * 0.1)  # blocs de 100 ms
+
+    stream = sd.InputStream(
+        samplerate=frequence,
+        channels=1,
+        dtype="int16"
+    )
+    stream.start()
+
+    blocs = []
+    temps_ecoule = 0.0
+    silence_duree = 0.0
+    a_parle = False
+
+    try:
+        while temps_ecoule < duree_max:
+            bloc, _ = stream.read(taille_bloc)
+            blocs.append(bloc.copy())
+
+            volume = np.abs(bloc).mean()
+
+            if volume > seuil_silence:
+                a_parle = True
+                silence_duree = 0.0
+            elif a_parle:
+                silence_duree += 0.1
+
+            temps_ecoule += 0.1
+
+            # On arrête dès qu'on a détecté de la parole
+            # PUIS un silence suffisant après.
+            if a_parle and silence_duree >= silence_max:
+                break
+
+    finally:
+        stream.stop()
+        stream.close()
+
+    if not blocs:
+        audio = np.zeros((1,), dtype="int16")
+    else:
+        audio = np.concatenate(blocs)
+
+    fichier_temporaire = tempfile.NamedTemporaryFile(
+        suffix=".wav",
+        delete=False
+    )
+    fichier_temporaire.close()
+
+    with wave.open(fichier_temporaire.name, "wb") as fichier:
+        fichier.setnchannels(1)
+        fichier.setsampwidth(2)
+        fichier.setframerate(frequence)
+        fichier.writeframes(audio.tobytes())
+
+    return fichier_temporaire.name
+
+
+# ==================================================
+# RECONNAISSANCE VOCALE
+# ==================================================
+
+def ecouter():
+    fichier_audio = enregistrer_audio()
+
+    recognizer = sr.Recognizer()
+    # Seuil d'énergie utilisé par la librairie pour juger si un
+    # son est "de la parole". Si Rick-E ne comprend rien, baisse
+    # cette valeur ; s'il capte trop de bruit ambiant, augmente-la.
+    recognizer.energy_threshold = 300
+
+    try:
+        with sr.AudioFile(fichier_audio) as source:
+            audio = recognizer.record(source)
+
+        texte = recognizer.recognize_google(
+            audio,
+            language="fr-FR"
+        )
+
+        print("TOI :", texte)
+
+        return texte.lower().strip()
+
+    except sr.UnknownValueError:
+        parler(
+            "Je n'ai rien compris. "
+            "Essaie de parler un peu plus clairement."
+        )
+        return ""
+
+    except sr.RequestError:
+        parler(
+            "Je ne peux pas contacter le service de reconnaissance vocale. "
+            "Vérifie ta connexion Internet."
+        )
+        return ""
+
+    finally:
+        if os.path.exists(fichier_audio):
+            os.remove(fichier_audio)
+
+
+# ==================================================
+# NETTOYAGE DES RÉPONSES
+# ==================================================
+
+def nettoyer_reponse(reponse):
+    reponse = reponse.lower().strip()
+
+    reponse = reponse.replace("é", "e")
+    reponse = reponse.replace("è", "e")
+    reponse = reponse.replace("ê", "e")
+    reponse = reponse.replace("à", "a")
+    reponse = reponse.replace("û", "u")
+
+    return reponse
+
+
+# ==================================================
+# QUESTIONS DE RICK-E
+# ==================================================
+
+questions = [
+    {"question": "Je suis plein de dents mais je ne mords jamais. Qui suis-je ?", "reponses": ["peigne", "un peigne", "le peigne"], "bonne_reponse": "un peigne", "explication": "C'est un peigne."},
+    {"question": "Je possède des aiguilles mais je ne pique pas. Qui suis-je ?", "reponses": ["horloge", "une horloge", "montre", "une montre"], "bonne_reponse": "une horloge ou une montre", "explication": "Une horloge possède des aiguilles."},
+    {"question": "Plus on m'en donne, plus on me tient. Qui suis-je ?", "reponses": ["promesse", "une promesse"], "bonne_reponse": "une promesse", "explication": "Quand on donne une promesse, on doit la tenir."},
+    {"question": "Je suis toujours mouillé quand je sèche quelque chose. Qui suis-je ?", "reponses": ["serviette", "une serviette"], "bonne_reponse": "une serviette", "explication": "Une serviette est mouillée quand elle sèche quelque chose."},
+    {"question": "Je monte et je descends sans jamais bouger. Qui suis-je ?", "reponses": ["escalier", "un escalier"], "bonne_reponse": "un escalier", "explication": "On monte et on descend un escalier."},
+    {"question": "Je suis toujours devant toi mais tu ne peux jamais me voir. Qui suis-je ?", "reponses": ["futur", "le futur", "avenir", "l'avenir"], "bonne_reponse": "le futur", "explication": "Le futur est devant nous mais on ne peut pas le voir."},
+    {"question": "Je peux être cassée sans être touchée. Qui suis-je ?", "reponses": ["promesse", "une promesse"], "bonne_reponse": "une promesse", "explication": "On peut casser une promesse sans la toucher."},
+    {"question": "Je suis invisible mais tu peux me sentir. Qui suis-je ?", "reponses": ["souffle", "le souffle", "vent", "le vent", "air", "l'air"], "bonne_reponse": "le vent ou l'air", "explication": "Le vent et l'air sont invisibles mais on peut les sentir."},
+    {"question": "Combien font 9 fois 6 ?", "reponses": ["54", "cinquante-quatre", "cinquante quatre"], "bonne_reponse": "54", "explication": "9 fois 6 font 54."},
+    {"question": "Je peux ouvrir des portes mais je n'ai pas de mains. Qui suis-je ?", "reponses": ["cle", "clé", "une cle", "une clé"], "bonne_reponse": "une clé", "explication": "Une clé ouvre une porte."},
+    {"question": "Quelle est la planète la plus proche du Soleil ?", "reponses": ["mercure"], "bonne_reponse": "Mercure", "explication": "Mercure est la planète la plus proche du Soleil."},
+    {"question": "J'ai trois côtés et trois angles. Qui suis-je ?", "reponses": ["triangle", "un triangle"], "bonne_reponse": "un triangle", "explication": "Un triangle possède trois côtés et trois angles."},
+    {"question": "Quel animal fait miaou ?", "reponses": ["chat", "un chat", "le chat"], "bonne_reponse": "un chat", "explication": "C'est le chat qui fait miaou."},
+    {"question": "Je donne l'heure mais je ne parle pas. Qui suis-je ?", "reponses": ["horloge", "une horloge", "montre", "une montre"], "bonne_reponse": "une horloge ou une montre", "explication": "Une horloge ou une montre donne l'heure."},
+    {"question": "Tu as 3 bonbons et tu en gagnes 2. Combien en as-tu ?", "reponses": ["5", "cinq"], "bonne_reponse": "5", "explication": "3 plus 2 font 5."}
+]
+
+
+# ==================================================
+# VÉRIFICATION DES RÉPONSES
+# ==================================================
+
+def verifier_reponse(reponse, question):
+    reponse = nettoyer_reponse(reponse)
+
+    for bonne_reponse in question["reponses"]:
+        bonne_reponse = nettoyer_reponse(bonne_reponse)
+
+        if bonne_reponse in reponse:
+            parler(
+                "Correct ! "
+                + random.choice([
+                    "Tu m'impressionnes presque.",
+                    "Pas mal pour un humain.",
+                    "Bonne réponse.",
+                    "Je savais que tu pouvais y arriver.",
+                    "Ton cerveau fonctionne finalement."
+                ])
+                + " "
+                + question["explication"]
+            )
+
+            # Bonne réponse : on déclenche la distribution de sucette
+            # (refusée automatiquement par l'Arduino si le servo est
+            # déjà verrouillé, ou si moins de 5 s se sont écoulées
+            # depuis la dernière distribution).
+            envoyer_commande_dispense()
+
+            return True
+
+    parler(
+        "Faux ! "
+        + random.choice([
+            "Il va falloir réviser.",
+            "Même ma mémoire défectueuse connaissait la réponse.",
+            "Essaie de faire fonctionner ton cerveau.",
+            "C'était pourtant facile.",
+            "Tu peux mieux faire."
+        ])
+        + " La bonne réponse était "
+        + question["bonne_reponse"]
+        + ". "
+        + question["explication"]
+    )
+
+    # Mauvaise réponse : la LED rouge clignote sur l'Arduino
+    envoyer_commande_erreur()
+
+    return False
+
+
+# ==================================================
+# INTERACTION AVEC L'UTILISATEUR
+# ==================================================
+
+def interaction():
+    parler("Bienvenue humain ! Moi c'est Riki, le gardien officiel des bonbons.")
+    parler("Tu veux un bonbon ? Évidemment que tu en veux un.")
+    parler("Mais il va falloir le mériter.")
+    parler("Je vais te poser 3 énigmes. Chaque bonne réponse peut te faire gagner une sucette.")
+    parler("Dis bonjour pour commencer le défi.")
+
+    reponse = ecouter()
+    if "bonjour" in reponse or "salut" in reponse:
+        parler("Bonjour humain ! Première épreuve réussie.")
+    else:
+        parler("Bon, ce n'était pas vraiment bonjour, mais on commence quand même.")
+
+    score = 0
+    questions_du_quiz = random.sample(questions, 3)
+
+    for numero, question in enumerate(questions_du_quiz, start=1):
+        parler(f"Énigme numéro {numero}.")
+        parler(question["question"])
+        reponse = ecouter()
+
+        if reponse and verifier_reponse(reponse, question):
+            score += 1
+        elif not reponse:
+            parler("Je n'ai pas entendu ta réponse. La bonne réponse était " + question["bonne_reponse"] + ".")
+            envoyer_commande_erreur()
+
+        time.sleep(1)
+
+    parler(f"Défi terminé ! Tu as obtenu {score} bonnes réponses sur 3.")
+    if score == 3:
+        parler("Impressionnant ! Tu as réussi toutes les énigmes. Bravo humain !")
+    elif score > 0:
+        parler("Pas mal ! Continue de réfléchir et tu deviendras peut-être aussi intelligent que moi.")
+    else:
+        parler("Aucune bonne réponse. Il va falloir réviser, humain.")
+
+    parler("Merci d'avoir joué avec Riki. À bientôt !")
+
+
+# ==================================================
+# LANCEMENT DU PROGRAMME
+# ==================================================
+
+if __name__ == "__main__":
+    connecter_arduino()
+    interaction()
