@@ -66,7 +66,7 @@ Il permet de :
 - enregistrer la réponse de l’utilisateur ;
 - utiliser la reconnaissance vocale ;
 - vérifier la réponse ;
-- envoyer des commandes à l’ESP32 par USB ;
+- envoyer des commandes à l’ESP32 par USB-C ;
 - gérer le déroulement du quiz.
 
 ### 2. Le programme ESP32
@@ -80,7 +80,6 @@ Il permet de :
 - afficher les expressions du robot ;
 - contrôler le servo-moteur ;
 - gérer la distribution de la sucette ;
-- lire éventuellement un badge RFID.
 
 ---
 
