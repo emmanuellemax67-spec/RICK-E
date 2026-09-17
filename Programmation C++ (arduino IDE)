@@ -1,0 +1,459 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Servo.h>
+
+// ==================================================
+// BROCHES ARDUINO UNO
+// ==================================================
+#define SERVO_PIN 9   // D9 (signal orange du SG90)
+#define LED_VERTE  7  // bonne réponse / distribution en cours
+#define LED_ROUGE  8  // mauvaise réponse / stock épuisé (clignote)
+
+// Les broches I2C sont FIXES sur l'Uno : SDA = A4, SCL = A5.
+
+#define ECRAN_LARGEUR 128
+#define ECRAN_HAUTEUR 64
+#define ECRAN_ADRESSE 0x3C  // 0x3D si le scanner I2C trouve cette adresse à la place
+
+// ==================================================
+// PARAMÈTRES DE DISTRIBUTION
+// ==================================================
+#define ANGLE_OUVERT   150   // MODIF : 150° au lieu de 120°
+#define ANGLE_FERME    0     // position de repos
+
+#define PAS_SERVO       3    // degrés parcourus à chaque étape (fluidité)
+#define DELAI_PAS       15   // ms entre deux étapes (vitesse du mouvement)
+
+// Pause entre le moment où le servo arrive en position ouverte et le
+// moment où il repart se refermer.
+#define PAUSE_OUVERT 5000
+
+#define DUREE_SATISFACTION   600   // ms de visage content juste après la distribution
+#define DUREE_MESSAGE_TRISTE 2000  // ms d'affichage du visage triste / stock vide
+#define DUREE_ATTENTE        1200  // ms d'affichage du message "PATIENTE..."
+
+// Délai minimum obligatoire entre deux distributions distinctes
+// (deux bonnes réponses successives, par exemple).
+#define DELAI_ENTRE_DISTRIBUTIONS 5000
+
+Adafruit_SSD1306 ecran(ECRAN_LARGEUR, ECRAN_HAUTEUR, &Wire, -1);
+Servo servomoteur;
+
+int sucettes_distribuees = 0;
+const int LIMITE_MAX = 3;   // quota de 3 sucettes
+
+// MODIF : verrou définitif. Une fois passé à true, il n'est JAMAIS
+// remis à false. Le servo est détaché et ne bougera plus, quoi que
+// le script Python envoie. Seule une coupure d'alimentation ou un
+// appui sur le bouton RESET de la carte peut le libérer.
+bool servo_bloque = false;
+
+// Instant de la dernière distribution effective. Initialisé de façon
+// à ce que la toute première distribution ne soit jamais bloquée par
+// le délai (astuce classique avec l'arithmétique non signée).
+unsigned long dernierDistribution = 0UL - DELAI_ENTRE_DISTRIBUTIONS;
+
+// ==================================================
+// ÉTATS DU VISAGE
+// ==================================================
+enum EtatVisage {
+  VISAGE_IDLE,
+  VISAGE_PARLE,
+  VISAGE_DISTRIBUTION,  // animation pendant l'ouverture, la pause et la fermeture
+  VISAGE_CONTENT,       // petit moment de satisfaction juste après
+  VISAGE_TRISTE,        // mauvaise réponse
+  VISAGE_COMPLET,       // quota atteint, plus de sucette disponible
+  VISAGE_ATTENTE        // distribution demandée trop tôt (< 5 s)
+};
+EtatVisage etatVisage = VISAGE_IDLE;
+
+unsigned long dernierClignement = 0;
+unsigned long prochainClignement = 3000;
+bool yeuxFermes = false;
+
+unsigned long dernierMouvementBouche = 0;
+bool boucheOuverte = false;
+
+unsigned long dernierClignementLedRouge = 0;
+bool ledRougeAllumee = false;
+
+// ==================================================
+// RÉCEPTION DES COMMANDES SÉRIE (pas de String, pour la RAM)
+// ==================================================
+#define TAILLE_TAMPON 16
+char tamponCommande[TAILLE_TAMPON];
+uint8_t indexTampon = 0;
+
+void gererLeds();  // déclaration anticipée
+
+
+// ==================================================
+// ÉLÉMENTS DU VISAGE (yeux ronds)
+// ==================================================
+
+void dessinerYeuxNormaux(bool fermes) {
+  int yCentre = 22;
+  int rayon = 15;
+  int xGauche = 30;
+  int xDroite = 98;
+
+  if (fermes) {
+    // yeux fermés : simple trait horizontal (clin d'œil / clignement)
+    ecran.fillRoundRect(xGauche - rayon, yCentre - 2, rayon * 2, 4, 2, SSD1306_WHITE);
+    ecran.fillRoundRect(xDroite - rayon, yCentre - 2, rayon * 2, 4, 2, SSD1306_WHITE);
+  } else {
+    ecran.fillCircle(xGauche, yCentre, rayon, SSD1306_WHITE);
+    ecran.fillCircle(xDroite, yCentre, rayon, SSD1306_WHITE);
+  }
+}
+
+void dessinerYeuxContent() {
+  ecran.fillTriangle(12, 32, 30, 8, 48, 32, SSD1306_WHITE);
+  ecran.fillTriangle(80, 32, 98, 8, 116, 32, SSD1306_WHITE);
+}
+
+void dessinerYeuxTriste() {
+  ecran.fillTriangle(12, 8, 30, 32, 48, 8, SSD1306_WHITE);
+  ecran.fillTriangle(80, 8, 98, 32, 116, 8, SSD1306_WHITE);
+}
+
+void dessinerBouche(bool ouverte) {
+  int largeurBouche = 50;
+  int xBouche = (ECRAN_LARGEUR - largeurBouche) / 2;
+  int yBouche = 48;
+
+  if (ouverte) {
+    ecran.fillRoundRect(xBouche, yBouche - 9, largeurBouche, 18, 7, SSD1306_WHITE);
+  } else {
+    ecran.fillRoundRect(xBouche, yBouche - 2, largeurBouche, 4, 2, SSD1306_WHITE);
+  }
+}
+
+void dessinerSourire() {
+  ecran.drawLine(28, 50, 50, 60, SSD1306_WHITE);
+  ecran.drawLine(50, 60, 78, 60, SSD1306_WHITE);
+  ecran.drawLine(78, 60, 100, 50, SSD1306_WHITE);
+}
+
+void dessinerMoue() {
+  ecran.drawLine(28, 58, 50, 48, SSD1306_WHITE);
+  ecran.drawLine(50, 48, 78, 48, SSD1306_WHITE);
+  ecran.drawLine(78, 48, 100, 58, SSD1306_WHITE);
+}
+
+// Quota affiché en permanence en haut à gauche.
+void afficherQuota() {
+  ecran.setTextSize(1);
+  ecran.setTextColor(SSD1306_WHITE);
+  ecran.setCursor(0, 0);
+  ecran.print(sucettes_distribuees);
+  ecran.print(F("/"));
+  ecran.print(LIMITE_MAX);
+}
+
+// Message centré tout en bas de l'écran (STOCK VIDE, PATIENTE...).
+void afficherMessageBas(const __FlashStringHelper* texte, int x) {
+  ecran.setTextSize(1);
+  ecran.setTextColor(SSD1306_WHITE);
+  ecran.setCursor(x, 56);
+  ecran.println(texte);
+}
+
+void mettreAJourEcran() {
+  ecran.clearDisplay();
+  afficherQuota();
+
+  switch (etatVisage) {
+
+    case VISAGE_IDLE: {
+      unsigned long maintenant = millis();
+
+      if (!yeuxFermes && maintenant - dernierClignement > prochainClignement) {
+        yeuxFermes = true;
+        dernierClignement = maintenant;
+      } else if (yeuxFermes && maintenant - dernierClignement > 150) {
+        yeuxFermes = false;
+        dernierClignement = maintenant;
+        prochainClignement = random(2000, 5000);
+      }
+
+      dessinerYeuxNormaux(yeuxFermes);
+      dessinerBouche(false);
+
+      // MODIF : une fois le servo verrouillé, on rappelle en bas de
+      // l'écran que le distributeur est définitivement fermé.
+      if (servo_bloque) {
+        afficherMessageBas(F("LIMITE ATTEINTE"), 34);
+      }
+      break;
+    }
+
+    case VISAGE_PARLE: {
+      unsigned long maintenant = millis();
+
+      if (maintenant - dernierMouvementBouche > 180) {
+        boucheOuverte = !boucheOuverte;
+        dernierMouvementBouche = maintenant;
+      }
+
+      dessinerYeuxNormaux(false);
+      dessinerBouche(boucheOuverte);
+      break;
+    }
+
+    case VISAGE_DISTRIBUTION: {
+      // Visage animé pendant l'ouverture, la pause et la fermeture du
+      // servo : yeux contents + bouche qui s'ouvre/ferme rapidement.
+      unsigned long maintenant = millis();
+
+      if (maintenant - dernierMouvementBouche > 150) {
+        boucheOuverte = !boucheOuverte;
+        dernierMouvementBouche = maintenant;
+      }
+
+      dessinerYeuxContent();
+      dessinerBouche(boucheOuverte);
+      break;
+    }
+
+    case VISAGE_CONTENT: {
+      dessinerYeuxContent();
+      dessinerSourire();
+      break;
+    }
+
+    case VISAGE_TRISTE: {
+      dessinerYeuxTriste();
+      dessinerMoue();
+      break;
+    }
+
+    case VISAGE_COMPLET: {
+      dessinerYeuxTriste();
+      dessinerMoue();
+      afficherMessageBas(F("STOCK VIDE"), 34);
+      break;
+    }
+
+    case VISAGE_ATTENTE: {
+      dessinerYeuxNormaux(false);
+      dessinerBouche(false);
+      afficherMessageBas(F("PATIENTE..."), 31);
+      break;
+    }
+  }
+
+  gererLeds();
+  ecran.display();
+}
+
+
+// ==================================================
+// GESTION DES LEDS
+// ==================================================
+void gererLeds() {
+  switch (etatVisage) {
+
+    case VISAGE_DISTRIBUTION:
+    case VISAGE_CONTENT:
+      digitalWrite(LED_VERTE, HIGH);
+      digitalWrite(LED_ROUGE, LOW);
+      break;
+
+    case VISAGE_TRISTE:
+    case VISAGE_COMPLET: {
+      digitalWrite(LED_VERTE, LOW);
+
+      unsigned long maintenant = millis();
+      if (maintenant - dernierClignementLedRouge > 250) {
+        ledRougeAllumee = !ledRougeAllumee;
+        digitalWrite(LED_ROUGE, ledRougeAllumee ? HIGH : LOW);
+        dernierClignementLedRouge = maintenant;
+      }
+      break;
+    }
+
+    default:
+      digitalWrite(LED_VERTE, LOW);
+      // MODIF : servo verrouillé -> la LED rouge reste allumée en
+      // continu (sans clignoter) même au repos.
+      digitalWrite(LED_ROUGE, servo_bloque ? HIGH : LOW);
+      break;
+  }
+}
+
+
+// ==================================================
+// MOUVEMENT DU SERVOMOTEUR
+// ==================================================
+void faireUnTour() {
+  // 1) Ouverture
+  for (int angle = ANGLE_FERME; angle <= ANGLE_OUVERT; angle += PAS_SERVO) {
+    servomoteur.write(angle);
+    mettreAJourEcran();
+    delay(DELAI_PAS);
+  }
+  servomoteur.write(ANGLE_OUVERT);
+
+  // 2) Pause réelle de 5 secondes en position ouverte, AVANT de
+  // refermer (le visage/LED continuent d'être mis à jour pendant
+  // ce temps grâce à mettreAJourEcran() appelé en boucle).
+  unsigned long debutPause = millis();
+  while (millis() - debutPause < PAUSE_OUVERT) {
+    mettreAJourEcran();
+    delay(20);
+  }
+
+  // 3) Fermeture
+  for (int angle = ANGLE_OUVERT; angle >= ANGLE_FERME; angle -= PAS_SERVO) {
+    servomoteur.write(angle);
+    mettreAJourEcran();
+    delay(DELAI_PAS);
+  }
+  servomoteur.write(ANGLE_FERME);
+}
+
+
+// ==================================================
+// DISTRIBUTION D'UNE SUCETTE
+// ==================================================
+void tenterDistribution() {
+
+  // MODIF : le verrou est testé en tout premier. Une fois posé,
+  // aucune commande DISPENSE ne peut plus faire bouger le servo.
+  if (servo_bloque || sucettes_distribuees >= LIMITE_MAX) {
+    Serial.println(F("REFUS: servo bloque (quota atteint)"));
+
+    etatVisage = VISAGE_COMPLET;
+    unsigned long debut = millis();
+    while (millis() - debut < DUREE_MESSAGE_TRISTE) {
+      mettreAJourEcran();
+      delay(20);
+    }
+
+  } else if (millis() - dernierDistribution < DELAI_ENTRE_DISTRIBUTIONS) {
+    etatVisage = VISAGE_ATTENTE;
+    unsigned long debut = millis();
+    while (millis() - debut < DUREE_ATTENTE) {
+      mettreAJourEcran();
+      delay(20);
+    }
+
+  } else {
+    sucettes_distribuees++;
+
+    etatVisage = VISAGE_DISTRIBUTION;
+    faireUnTour();
+    dernierDistribution = millis();
+
+    etatVisage = VISAGE_CONTENT;
+    unsigned long debut = millis();
+    while (millis() - debut < DUREE_SATISFACTION) {
+      mettreAJourEcran();
+      delay(20);
+    }
+
+    // MODIF : la 3e sucette vient d'être distribuée et le servo est
+    // revenu en position fermée -> on verrouille définitivement et on
+    // détache le servo (plus aucun signal PWM, il ne tiendra même
+    // plus sa position et ne consommera plus).
+    if (sucettes_distribuees >= LIMITE_MAX) {
+      servo_bloque = true;
+      servomoteur.detach();
+      Serial.println(F("QUOTA ATTEINT: servo verrouille definitivement"));
+    }
+  }
+
+  etatVisage = VISAGE_IDLE;
+}
+
+
+// ==================================================
+// RÉPONSE INCORRECTE (signalée par le script Python)
+// ==================================================
+void reponseIncorrecte() {
+  etatVisage = VISAGE_TRISTE;
+  unsigned long debut = millis();
+  while (millis() - debut < DUREE_MESSAGE_TRISTE) {
+    mettreAJourEcran();
+    delay(20);
+  }
+  etatVisage = VISAGE_IDLE;
+}
+
+
+// ==================================================
+// LECTURE DES COMMANDES ENVOYÉES PAR LE SCRIPT PYTHON
+// ==================================================
+void verifierCommandeSerie() {
+  while (Serial.available() > 0) {
+    char c = Serial.read();
+
+    if (c == '\n') {
+      tamponCommande[indexTampon] = '\0';
+      indexTampon = 0;
+
+      if (strcmp(tamponCommande, "DISPENSE") == 0) {
+        Serial.println(F("OK: distribution en cours"));
+        tenterDistribution();
+
+      } else if (strcmp(tamponCommande, "ERREUR") == 0) {
+        Serial.println(F("OK: mauvaise reponse signalee"));
+        reponseIncorrecte();
+
+      } else if (strcmp(tamponCommande, "PARLE_DEBUT") == 0) {
+        etatVisage = VISAGE_PARLE;
+
+      } else if (strcmp(tamponCommande, "PARLE_FIN") == 0) {
+        etatVisage = VISAGE_IDLE;
+      }
+
+    } else if (c != '\r' && indexTampon < TAILLE_TAMPON - 1) {
+      tamponCommande[indexTampon++] = c;
+    }
+  }
+}
+
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println(F(">>> DEMARRAGE SETUP (Rick-E)"));
+
+  randomSeed(analogRead(A0));
+
+  pinMode(LED_VERTE, OUTPUT);
+  pinMode(LED_ROUGE, OUTPUT);
+  digitalWrite(LED_VERTE, LOW);
+  digitalWrite(LED_ROUGE, LOW);
+
+  Serial.println(F(">>> Init ecran OLED (I2C fixe A4/A5)..."));
+  Wire.begin();
+  if (!ecran.begin(SSD1306_SWITCHCAPVCC, ECRAN_ADRESSE)) {
+    Serial.println(F("Erreur : ecran OLED non detecte !"));
+  } else {
+    Serial.println(F(">>> Ecran OLED OK"));
+  }
+  ecran.clearDisplay();
+  ecran.display();
+
+  Serial.println(F(">>> Init servo..."));
+  servomoteur.attach(SERVO_PIN);
+  servomoteur.write(ANGLE_FERME);
+  Serial.println(F(">>> Servo OK"));
+
+  // Le quota repart à 0 uniquement au démarrage / après un vrai reset
+  // matériel. Le script Python n'en provoque plus (DTR désactivé).
+  sucettes_distribuees = 0;
+  servo_bloque = false;
+
+  etatVisage = VISAGE_IDLE;
+  Serial.println(F(">>> SETUP TERMINE"));
+}
+
+void loop() {
+  verifierCommandeSerie();
+
+  mettreAJourEcran();
+  delay(20);
+}
