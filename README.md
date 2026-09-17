@@ -22,7 +22,7 @@ Les objectifs du projet sont :
 - utiliser la reconnaissance vocale ;
 - poser des questions à l’utilisateur ;
 - vérifier les réponses ;
-- communiquer entre un ordinateur et un ESP32 ;
+- communiquer entre un ordinateur et un Arduino UNO R3 ;
 - afficher des expressions sur un écran OLED ;
 - commander un servo-moteur ;
 - distribuer une sucette en cas de bonne réponse ;
@@ -42,8 +42,8 @@ Le fonctionnement du robot est le suivant :
 6. Python vérifie si la réponse est correcte.
 7. Si la réponse est correcte :
    - le robot annonce la réussite ;
-   - Python envoie la commande `DISPENSE` à l’ESP32 ;
-   - l’ESP32 fait tourner le servo-moteur ;
+   - Python envoie la commande `DISPENSE` à l’Arduino UNO R3 ;
+   - l’Arduino UNO R3 fait tourner le servo-moteur ;
    - le robot distribue une sucette ;
    - le servo revient à sa position initiale.
 8. Si la réponse est incorrecte, le robot indique que la réponse n’est pas correcte.
@@ -66,12 +66,12 @@ Il permet de :
 - enregistrer la réponse de l’utilisateur ;
 - utiliser la reconnaissance vocale ;
 - vérifier la réponse ;
-- envoyer des commandes à l’ESP32 par USB-C ;
+- envoyer des commandes à l’Arduino UNO R3 par USB ;
 - gérer le déroulement du quiz.
 
-### 2. Le programme ESP32
+### 2. Le programme Arduino UNO R3
 
-L’ESP32 contrôle la partie électronique du robot.
+L’Arduino UNO R3 contrôle la partie électronique du robot.
 
 Il permet de :
 
@@ -83,13 +83,13 @@ Il permet de :
 
 ---
 
-## Communication entre Python et l’ESP32
+## Communication entre Python et l’Arduino UNO R3
 
 La communication se fait par un câble USB en liaison série.
 
 ### Paramètres utilisés
 
-- Port série : `COM3`
+- Port série : `COM5`
 - Vitesse : `115200 bauds`
 
 ### Commandes principales
